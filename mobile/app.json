@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Visual Aid",
+    "slug": "visual-aid",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "This app needs camera access to detect objects and help you navigate safely.",
+        "NSSpeechRecognitionUsageDescription": "This app uses speech recognition for voice commands.",
+        "NSMicrophoneUsageDescription": "This app needs microphone access for voice commands."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "@react-native-voice/voice",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "This app needs camera access to detect objects and help you navigate safely."
+        }
+      ]
+    ]
+  }
+}
