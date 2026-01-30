@@ -14,6 +14,41 @@ export const CLASS_NAMES = [
     "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
 ];
 
+export const DISPLAY_LABELS: Record<string, string> = {
+    "cell phone": "phone",
+    "book": "book / paper",
+    "laptop": "laptop / computer",
+    "dining table": "table",
+    "bottle": "bottle / water bottle",
+    "cup": "cup / mug",
+    "wine glass": "glass",
+    "handbag": "bag",
+    "backpack": "backpack / bag",
+    "suitcase": "bag",
+    "tv": "TV / monitor",
+    "keyboard": "keyboard",
+    "mouse": "mouse",
+    "chair": "chair",
+    "couch": "couch / sofa",
+    "potted plant": "plant",
+    "toilet": "toilet",
+    "sink": "sink",
+    "refrigerator": "refrigerator",
+    "oven": "oven",
+    "microwave": "microwave",
+    "toaster": "toaster",
+    "clock": "clock",
+    "fork": "fork",
+    "knife": "knife",
+    "spoon": "spoon",
+    "bowl": "bowl",
+    "apple": "apple",
+    "banana": "banana",
+    "orange": "orange",
+    "pizza": "pizza",
+    "sandwich": "sandwich",
+};
+
 export interface DetectionResult {
     class: string;
     confidence: number;
@@ -30,7 +65,7 @@ export const loadModel = async () => {
     try {
         console.log("Loading YOLO26n model...");
         // @ts-ignore
-        model = await loadTensorflowModel(require('../assets/models/yolo26n.tflite'));
+        model = await loadTensorflowModel(require('../assets/models/yolo26n_float32.tflite'));
         console.log("Model loaded successfully!");
         return model;
     } catch (e) {

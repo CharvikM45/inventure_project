@@ -12,6 +12,7 @@ interface Detection {
     width: number;
     height: number;
     proximity?: 'close' | 'medium' | 'far';
+    direction?: 'left' | 'center' | 'right';
     isShape?: boolean;
     isText?: boolean;
 }
@@ -64,7 +65,7 @@ export default function DetectionOverlay({ detections, frameWidth, frameHeight }
                         }
                     }
 
-                    // Default: draw rectangle
+                    // Default: draw rectangle (thick stroke so detection boxes are clearly visible)
                     return (
                         <Rect
                             key={`detection-${index}`}
@@ -73,7 +74,7 @@ export default function DetectionOverlay({ detections, frameWidth, frameHeight }
                             width={width}
                             height={height}
                             stroke={color}
-                            strokeWidth={detection.isText ? 2 : 3}
+                            strokeWidth={detection.isText ? 2 : 5}
                             strokeDasharray={detection.isText ? "5,5" : undefined}
                             fill="transparent"
                         />
@@ -94,13 +95,15 @@ export default function DetectionOverlay({ detections, frameWidth, frameHeight }
                             styles.label,
                             {
                                 left: x,
-                                top: y > 30 ? y - 28 : y + 4,
+                                top: y > 32 ? y - 30 : y + 4,
                                 backgroundColor: color,
                             },
                         ]}
                     >
                         <Text style={styles.labelText} numberOfLines={1}>
                             {detection.class}
+                            {detection.direction != null && ` · ${detection.direction}`}
+                            {detection.proximity != null && ` · ${detection.proximity}`}
                         </Text>
                         {!detection.isText && (
                             <Text style={styles.confidenceText}>
@@ -130,16 +133,18 @@ const styles = StyleSheet.create({
     label: {
         position: 'absolute',
         paddingHorizontal: 8,
-        paddingVertical: 4,
+        paddingVertical: 5,
         borderRadius: 4,
         flexDirection: 'row',
         alignItems: 'center',
         gap: 4,
-        maxWidth: 200,
+        maxWidth: 220,
+        borderWidth: 1,
+        borderColor: 'rgba(0,0,0,0.3)',
     },
     labelText: {
         color: '#fff',
-        fontSize: 12,
+        fontSize: 13,
         fontWeight: '700',
     },
     confidenceText: {
