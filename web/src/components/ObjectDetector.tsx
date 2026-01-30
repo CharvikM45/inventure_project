@@ -1,453 +1,227 @@
 "use client";
 
-import { useEffect, useRef, useCallback, useState } from "react";
+import React, { useRef, useState, useEffect, useCallback } from "react";
 import Webcam from "react-webcam";
-import * as cocoSsd from "@tensorflow-models/coco-ssd";
-import * as mobilenet from "@tensorflow-models/mobilenet";
-import * as faceapi from '@vladmandic/face-api';
-import Tesseract from 'tesseract.js';
-import "@tensorflow/tfjs";
-import { loadModels as loadFaceModels, matchFace } from "@/hooks/useFaceRecognition";
+import * as tf from "@tensorflow/tfjs";
+import "@tensorflow/tfjs-backend-webgl";
 
-interface Detection {
-    bbox: [number, number, number, number];
-    class: string;
-    score: number;
-    proximity?: 'close' | 'medium' | 'far';
-    name?: string; // For identified faces
-}
+const CLASS_NAMES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket", "bottle",
+    "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange", "broccoli",
+    "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant", "bed", "dining table",
+    "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave", "oven", "toaster",
+    "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
+];
 
-// Estimate proximity based on bounding box size relative to frame
-function estimateProximity(
-    bbox: [number, number, number, number],
-    frameWidth: number,
-    frameHeight: number
-): 'close' | 'medium' | 'far' {
-    const [, , w, h] = bbox;
-    const bboxArea = w * h;
-    const frameArea = frameWidth * frameHeight;
-    const ratio = bboxArea / frameArea;
-
-    if (ratio > 0.12) return 'close';   // > 12% of frame
-    if (ratio > 0.025) return 'medium'; // 2.5-12% of frame
-    return 'far';                        // < 2.5% of frame
-}
-
-function getProximityLabel(proximity: 'close' | 'medium' | 'far'): string {
-    switch (proximity) {
-        case 'close': return 'nearby';
-        case 'medium': return '';
-        case 'far': return 'far away';
-    }
-}
-
-function getProximityColor(proximity: 'close' | 'medium' | 'far'): string {
-    switch (proximity) {
-        case 'close': return '#ef4444';  // Red for close
-        case 'medium': return '#f59e0b'; // Amber for medium
-        case 'far': return '#22c55e';    // Green for far
-    }
-}
-
-interface TrackedObject {
-    id: string;
-    class: string;
-    bbox: [number, number, number, number];
-    lastSeen: number;
-    prevArea: number;
-    approaching: boolean;
-}
-
-interface KnownPerson {
-    name: string;
-    descriptor: number[];
-}
-
-interface ObjectDetectorProps {
-    onDetections: (detections: Detection[]) => void;
-    onApproaching: (object: TrackedObject) => void;
-    onQueryResponse: (response: string) => void;
-    queryTrigger: number;
-    staticImage?: string | null;
-    knownPeople?: KnownPerson[];
-}
-
-export default function ObjectDetector({
-    onDetections,
-    onApproaching,
-    onQueryResponse,
-    queryTrigger,
-    staticImage,
-    knownPeople = [],
-}: ObjectDetectorProps) {
+export default function ObjectDetector() {
     const webcamRef = useRef<Webcam>(null);
     const canvasRef = useRef<HTMLCanvasElement>(null);
-    const imgRef = useRef<HTMLImageElement>(null);
-    const modelRef = useRef<cocoSsd.ObjectDetection | null>(null);
-    const mobilenetRef = useRef<mobilenet.MobileNet | null>(null);
-    const trackedObjectsRef = useRef<Map<string, TrackedObject>>(new Map());
-    const identifiedPeopleRef = useRef<Map<string, number>>(new Map()); // name -> lastSeen
+    const [model, setModel] = useState<tf.GraphModel | null>(null);
+    const [loading, setLoading] = useState(true);
 
-    const [isLoading, setIsLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
-    const lastDetectionsRef = useRef<Detection[]>([]);
-
-    // Load models
+    // Load Model
     useEffect(() => {
-        const load = async () => {
+        const loadModel = async () => {
             try {
-                const [model, net] = await Promise.all([
-                    cocoSsd.load({ base: "lite_mobilenet_v2" }),
-                    mobilenet.load(),
-                    loadFaceModels(),
-                ]);
-                modelRef.current = model;
-                mobilenetRef.current = net;
-                setIsLoading(false);
+                setLoading(true);
+                // Ensure webgl backend is ready
+                await tf.setBackend("webgl");
+                await tf.ready();
+
+                console.log("Loading YOLO web model...");
+                // Path matches the instruction to user: web/public/model/yolo26n_web_model/model.json
+                const loadedModel = await tf.loadGraphModel("/model/yolo26n_web_model/model.json");
+                setModel(loadedModel);
+                console.log("Model loaded!", loadedModel);
+                setLoading(false);
             } catch (err) {
-                setError("Failed to load AI models");
-                console.error(err);
+                console.error("Failed to load model", err);
+                setLoading(false);
             }
         };
-        load();
+        loadModel();
     }, []);
 
-    // Handle "What is that?" query
-    useEffect(() => {
-        const handleQuery = async () => {
-            if (queryTrigger > 0) {
-                let element: HTMLVideoElement | HTMLImageElement | null = null;
-                if (staticImage && imgRef.current) element = imgRef.current;
-                else if (webcamRef.current?.video && webcamRef.current.video.readyState === 4) element = webcamRef.current.video;
-
-                if (!element) {
-                    onQueryResponse("I cannot see clearly right now");
-                    return;
-                }
-
-                // 1. Get OCR for brand/label recognition
-                let recognizedText = "";
-                try {
-                    const { data: { text } } = await Tesseract.recognize(element, 'eng');
-                    // Filter for meaningful words (brands usually stand out)
-                    const words = text.split(/\s+/).filter(w => w.length > 2 && !/^(the|and|for|with)$/i.test(w));
-                    if (words.length > 0) {
-                        recognizedText = words.slice(0, 3).join(' '); // Take top 3 words
-                    }
-                } catch (err) {
-                    console.error("OCR failed", err);
-                }
-
-                // 2. Get MobileNet classification for potentially better object detail
-                let detailedObject = "";
-                if (mobilenetRef.current) {
-                    const predictions = await mobilenetRef.current.classify(element, 3);
-                    const validPredictions = predictions.filter(p => p.probability > 0.2);
-
-                    if (validPredictions.length > 0) {
-                        const top = validPredictions[0];
-                        if (validPredictions.length > 1 && validPredictions[1].probability > 0.3) {
-                            detailedObject = `${top.className}, or maybe a ${validPredictions[1].className}`;
-                        } else {
-                            detailedObject = top.className;
-                        }
-                    }
-                }
-
-                // 3. Build comprehensive description from detection boxes
-                const detections = lastDetectionsRef.current;
-                const closeItems: string[] = [];
-                const mediumItems: string[] = [];
-                const farItems: string[] = [];
-
-                detections.forEach(d => {
-                    const displayName = d.name || d.class;
-                    // Don't duplicate if MobileNet found the same thing
-                    if (detailedObject && displayName.toLowerCase().includes(detailedObject.toLowerCase().split(',')[0])) return;
-
-                    const proximity = d.proximity || 'medium';
-                    if (proximity === 'close') closeItems.push(displayName);
-                    else if (proximity === 'far') farItems.push(displayName);
-                    else mediumItems.push(displayName);
-                });
-
-                const parts: string[] = [];
-
-                if (recognizedText) {
-                    parts.push(`I can read the label: "${recognizedText}"`);
-                }
-
-                if (detailedObject) {
-                    parts.push(`This looks like a ${detailedObject}`);
-                }
-
-                if (closeItems.length > 0) {
-                    const items = [...new Set(closeItems)].join(', ');
-                    parts.push(`${items} nearby`);
-                }
-                if (mediumItems.length > 0) {
-                    const items = [...new Set(mediumItems)].join(', ');
-                    parts.push(items);
-                }
-                if (farItems.length > 0) {
-                    const items = [...new Set(farItems)].join(', ');
-                    parts.push(`${items} far away`);
-                }
-
-                if (parts.length > 0) {
-                    onQueryResponse(parts.join('. '));
-                } else {
-                    onQueryResponse("I cannot identify any objects right now");
-                }
-            }
-        };
-        handleQuery();
-    }, [queryTrigger, onQueryResponse, staticImage]);
-
-
-    // Detection logic for static image
-    const detectStatic = useCallback(async () => {
-        if (!modelRef.current || !imgRef.current || !canvasRef.current) return;
-
-        const img = imgRef.current;
-        const predictions = await modelRef.current.detect(img);
-
-        // Add proximity to each prediction
-        const enhancedPredictions: Detection[] = predictions.map(pred => ({
-            ...pred,
-            proximity: estimateProximity(pred.bbox, img.naturalWidth, img.naturalHeight),
-        }));
-
-        lastDetectionsRef.current = enhancedPredictions;
-
-        const ctx = canvasRef.current.getContext("2d");
-        if (!ctx) return;
-
-        canvasRef.current.width = img.naturalWidth;
-        canvasRef.current.height = img.naturalHeight;
-        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-
-        enhancedPredictions.forEach((pred) => {
-            const [x, y, w, h] = pred.bbox;
-            const proximity = pred.proximity || 'medium';
-            const color = getProximityColor(proximity);
-            const proximityLabel = getProximityLabel(proximity);
-
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 3;
-            ctx.strokeRect(x, y, w, h);
-            ctx.fillStyle = color;
-            ctx.font = "bold 16px Arial";
-
-            const label = proximityLabel
-                ? `${pred.class} (${proximityLabel})`
-                : pred.class;
-            ctx.fillText(label, x, y > 20 ? y - 5 : y + 20);
-        });
-
-        onDetections(enhancedPredictions);
-    }, [onDetections]);
-
-
-    // Detection loop for webcam
-    const detectWebcam = useCallback(async () => {
-        if (
-            !modelRef.current ||
-            !webcamRef.current?.video ||
-            !canvasRef.current
-        )
+    // Detection Loop
+    const detect = useCallback(async () => {
+        // console.log("Detect loop iteration...");
+        if (!model) {
+            console.log("Model not loaded yet in detect loop");
+            requestAnimationFrame(detect);
             return;
-
-        const video = webcamRef.current.video;
-        if (video.readyState !== 4) return;
-
-        const frameWidth = video.videoWidth;
-        const frameHeight = video.videoHeight;
-
-        // Run object detection and face recognition in parallel
-        const [predictions, faceDetections] = await Promise.all([
-            modelRef.current.detect(video),
-            faceapi.detectAllFaces(video, new faceapi.TinyFaceDetectorOptions())
-                .withFaceLandmarks()
-                .withFaceDescriptors()
-        ]);
-
-        // Draw on canvas
-        const ctx = canvasRef.current.getContext("2d");
-        if (!ctx) return;
-
-        canvasRef.current.width = frameWidth;
-        canvasRef.current.height = frameHeight;
-        ctx.clearRect(0, 0, frameWidth, frameHeight);
-
-        // Collect all detections (faces + objects) with proximity
-        const allDetections: Detection[] = [];
-        const now = Date.now();
-
-        // Handle faces and identification
-        faceDetections.forEach(fd => {
-            const { x, y, width, height } = fd.detection.box;
-            const bbox: [number, number, number, number] = [x, y, width, height];
-            const proximity = estimateProximity(bbox, frameWidth, frameHeight);
-            const match = matchFace(fd.descriptor, knownPeople);
-            const proximityLabel = getProximityLabel(proximity);
-
-            // Use proximity color for border
-            const color = getProximityColor(proximity);
-            ctx.strokeStyle = match ? "#a855f7" : color;
-            ctx.lineWidth = 4;
-            ctx.strokeRect(x, y, width, height);
-
-            // Label with name and proximity
-            const displayName = match || "person";
-            const label = proximityLabel
-                ? `${displayName} (${proximityLabel})`
-                : displayName;
-
-            ctx.fillStyle = match ? "#a855f7" : color;
-            ctx.font = "bold 18px Arial";
-            ctx.fillText(label, x, y > 25 ? y - 8 : y + height + 18);
-
-            // Add to detections array
-            allDetections.push({
-                bbox,
-                class: "person",
-                score: fd.detection.score,
-                proximity,
-                name: match || undefined,
-            });
-
-            // Alert if first time seeing identified person or after 10s
-            if (match) {
-                const lastSeen = identifiedPeopleRef.current.get(match) || 0;
-                if (now - lastSeen > 10000) {
-                    identifiedPeopleRef.current.set(match, now);
-                    const proximityText = proximity === 'close' ? 'right in front of you'
-                        : proximity === 'far' ? 'in the distance'
-                            : 'nearby';
-                    onQueryResponse(`${match} is ${proximityText}`);
-                }
-            }
-        });
-
-        // Track objects and detect approaching
-        const newTracked = new Map<string, TrackedObject>();
-
-        predictions.forEach((pred, idx) => {
-            const [x, y, w, h] = pred.bbox;
-            const area = w * h;
-            const key = `${pred.class}_${idx}`;
-            const proximity = estimateProximity(pred.bbox, frameWidth, frameHeight);
-            const proximityLabel = getProximityLabel(proximity);
-            const color = getProximityColor(proximity);
-
-            // Draw bounding box (skip if already drawing face for person)
-            const isFaceArea = faceDetections.some(fd => {
-                const box = fd.detection.box;
-                return x < box.x + box.width && x + w > box.x && y < box.y + box.height && y + h > box.y;
-            });
-
-            if (pred.class !== "person" || !isFaceArea) {
-                ctx.strokeStyle = color;
-                ctx.lineWidth = 3;
-                ctx.strokeRect(x, y, w, h);
-
-                ctx.fillStyle = color;
-                ctx.font = "bold 16px Arial";
-
-                const label = proximityLabel
-                    ? `${pred.class} (${proximityLabel})`
-                    : pred.class;
-                ctx.fillText(label, x, y > 20 ? y - 5 : y + 20);
-
-                // Add non-person or non-face-overlapping items to detections
-                allDetections.push({
-                    ...pred,
-                    proximity,
-                });
-            }
-
-            // Check if approaching
-            const existing = trackedObjectsRef.current.get(key);
-            const approaching =
-                existing && area > existing.prevArea * 1.15 && pred.class === "person";
-
-            const tracked: TrackedObject = {
-                id: key,
-                class: pred.class,
-                bbox: pred.bbox,
-                lastSeen: now,
-                prevArea: area,
-                approaching: !!approaching,
-            };
-
-            newTracked.set(key, tracked);
-
-            if (approaching) {
-                onApproaching(tracked);
-            }
-        });
-
-        trackedObjectsRef.current = newTracked;
-        lastDetectionsRef.current = allDetections;
-        onDetections(allDetections);
-    }, [onDetections, onApproaching, knownPeople, onQueryResponse]);
-
-
-    // Run detection loop
-    useEffect(() => {
-        if (isLoading) return;
-
-        if (staticImage) {
-            detectStatic();
+        }
+        if (!webcamRef.current || !canvasRef.current) {
+            console.log("Refs missing");
+            requestAnimationFrame(detect);
             return;
         }
 
-        const interval = setInterval(detectWebcam, 150);
-        return () => clearInterval(interval);
-    }, [isLoading, detectWebcam, detectStatic, staticImage]);
+        const video = webcamRef.current.video;
+        if (!video || video.readyState !== 4) {
+            console.log("Video not ready. ReadyState:", video?.readyState);
+            requestAnimationFrame(detect);
+            return;
+        }
 
-    if (error) {
-        return (
-            <div className="flex h-screen items-center justify-center bg-black text-red-500 text-xl">
-                {error}
-            </div>
-        );
-    }
+        const { videoWidth, videoHeight } = video;
+        canvasRef.current.width = videoWidth;
+        canvasRef.current.height = videoHeight;
+
+        // 1. Preprocess
+        // console.log("Preprocessing frame...");
+        const tfImg = tf.browser.fromPixels(video);
+        // Resize to 640x640 (standard YOLO input)
+        const resized = tf.image.resizeBilinear(tfImg, [640, 640]);
+        const casted = resized.cast("float32");
+        const expanded = casted.expandDims(0); // [1, 640, 640, 3]
+        const normalized = expanded.div(255.0); // Normalize to 0-1
+
+        // 2. Inference
+        try {
+            const result = await model.executeAsync(normalized);
+            // YOLOv8/26 output is usually [1, 84, 8400] (transposed) or [1, 5+80, 8400]
+            // We need to check shape.
+
+            let resTensor = Array.isArray(result) ? result[0] : result;
+            console.log("Model Output Shape:", resTensor.shape);
+
+            // Parse results
+            // We will do this on CPU for simplicity in this version, 
+            // though WebGL/GPU optimization exists.
+            const data = await resTensor.array() as number[][][];
+            // data[0] is the batch 0 output
+
+            const prediction = data[0]; // shape ideally [84, 8400] (or similar transposed)
+            console.log("Prediction Sample (feature 0, first 10):", prediction[0]?.slice(0, 10));
+            console.log("Prediction Dimensions: ", prediction.length, "x", prediction[0]?.length);
+            // If shape is [1, 300, 6] (NMS free), handle that.
+
+            tf.dispose([tfImg, resized, casted, expanded, normalized, resTensor]);
+            if (Array.isArray(result)) result.forEach(t => t.dispose());
+
+            drawDetections(prediction, canvasRef.current);
+
+        } catch (e) {
+            console.error(e);
+        }
+
+        // Loop
+        requestAnimationFrame(detect);
+    }, [model]);
+
+    useEffect(() => {
+        if (model && !loading) {
+            detect();
+        }
+    }, [model, loading, detect]);
+
+    const drawDetections = (prediction: number[][], canvas: HTMLCanvasElement) => {
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Heuristic signature check
+        // If output is [300, 6] (NMS free) vs [84, 8400] (Standard)
+
+        // NMS Free (transposed or not? Standard is usually [batch, dets, 6])
+        // If prediction.length is 300 and prediction[0].length is 6
+        if (prediction.length === 300 && prediction[0].length === 6) {
+            // [x, y, w, h, score, class]
+            prediction.forEach(det => {
+                const score = det[4];
+                if (score > 0.45) {
+                    const x = det[0];
+                    const y = det[1];
+                    const w = det[2];
+                    const h = det[3];
+                    const cls = Math.round(det[5]);
+
+                    // Check if coordinates are normalized or pixels. 
+                    // Usually pixels relative to input 640x640.
+                    // We need to scale to video size.
+                    const scaleX = canvas.width / 640;
+                    const scaleY = canvas.height / 640;
+
+                    drawBox(ctx, x * scaleX, y * scaleY, w * scaleX, h * scaleY, score, cls);
+                }
+            });
+            return;
+        }
+
+        // Standard YOLOv8 [84, 8400] -> rows=features, cols=anchors
+        // We need to transpose to iterate anchors easily if it comes in [features, anchors]
+        // But data comes as array of arrays.
+
+        // Let's assume standard [84, 8400]. 
+        const numAnchors = prediction[0].length; // 8400
+        const numFeatures = prediction.length;   // 84
+
+        if (numAnchors === 8400) {
+            // We iterate anchors
+            for (let i = 0; i < numAnchors; i++) {
+                // Find max class score
+                let maxScore = 0;
+                let maxClass = -1;
+
+                // Classes start at index 4
+                for (let c = 0; c < 80; c++) {
+                    const score = prediction[4 + c][i];
+                    if (score > maxScore) {
+                        maxScore = score;
+                        maxClass = c;
+                    }
+                }
+
+                if (maxScore > 0.5) {
+                    const cx = prediction[0][i]; // 640 scale
+                    const cy = prediction[1][i];
+                    const w = prediction[2][i];
+                    const h = prediction[3][i];
+
+                    const scaleX = canvas.width / 640;
+                    const scaleY = canvas.height / 640;
+
+                    // cx,cy,w,h are in 640x640 space usually
+                    drawBox(ctx, cx * scaleX, cy * scaleY, w * scaleX, h * scaleY, maxScore, maxClass);
+                }
+            }
+        }
+    };
+
+    const drawBox = (ctx: CanvasRenderingContext2D, cx: number, cy: number, w: number, h: number, score: number, cls: number) => {
+        const x = cx - w / 2;
+        const y = cy - h / 2;
+
+        ctx.strokeStyle = "#00FF00";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, w, h);
+
+        ctx.fillStyle = "#00FF00";
+        ctx.font = "16px Arial";
+        ctx.fillText(`${CLASS_NAMES[cls] || cls} ${(score * 100).toFixed(1)}%`, x, y > 20 ? y - 5 : y + 15);
+    };
 
     return (
-        <div className="relative w-full h-full">
-            {isLoading && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/80 z-20">
-                    <div className="text-white text-xl animate-pulse">
-                        Loading AI Models...
-                    </div>
+        <div className="relative w-full max-w-2xl mx-auto overflow-hidden rounded-lg shadow-lg bg-black">
+            {loading && (
+                <div className="absolute inset-0 flex items-center justify-center z-50 bg-black/50 text-white">
+                    Loading Model...
                 </div>
             )}
-            {staticImage ? (
-                <img
-                    ref={imgRef}
-                    src={staticImage}
-                    alt="To be analyzed"
-                    className="absolute inset-0 w-full h-full object-contain bg-black"
-                    onLoad={detectStatic}
-                />
-            ) : (
-                <Webcam
-                    ref={webcamRef}
-                    audio={false}
-                    screenshotFormat="image/jpeg"
-                    videoConstraints={{
-                        facingMode: "environment",
-                        width: { ideal: 1280 },
-                        height: { ideal: 720 },
-                    }}
-                    className="absolute inset-0 w-full h-full object-cover"
-                />
-            )}
+            <Webcam
+                ref={webcamRef}
+                className="w-full h-auto"
+                screenshotFormat="image/jpeg"
+                videoConstraints={{
+                    facingMode: "environment"
+                }}
+            />
             <canvas
                 ref={canvasRef}
-                className={`absolute inset-0 w-full h-full pointer-events-none ${staticImage ? 'object-contain' : 'object-cover'}`}
+                className="absolute top-0 left-0 w-full h-full pointer-events-none"
             />
         </div>
     );

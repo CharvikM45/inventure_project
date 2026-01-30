@@ -35,13 +35,15 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
-      "@react-native-voice/voice",
       [
         "expo-camera",
         {
           "cameraPermission": "This app needs camera access to detect objects and help you navigate safely."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "geminiApiKey": "YOUR_GEMINI_API_KEY_HERE"
+    }
   }
 }

@@ -5,393 +5,258 @@ import {
     Text,
     TouchableOpacity,
     Dimensions,
-    Image,
+    ActivityIndicator,
+    PixelRatio,
 } from 'react-native';
-import { CameraView, useCameraPermissions } from 'expo-camera';
+import {
+    Camera,
+    useCameraDevice,
+    useCameraPermission,
+    useFrameProcessor,
+    runAtTargetFps
+} from 'react-native-vision-camera';
+import { useResizePlugin } from 'vision-camera-resize-plugin';
+import { Worklets } from 'react-native-worklets-core';
 import { useVoiceAssistant } from '../hooks/useVoiceAssistant';
+import { loadModel, DetectionResult, CLASS_NAMES } from '../services/ObjectDetectionService';
+import DetectionOverlay from '../components/DetectionOverlay';
+import { useSharedValue } from 'react-native-reanimated';
+import { TensorflowModel } from 'react-native-fast-tflite';
 
 const { width, height } = Dimensions.get('window');
 
-interface Detection {
-    class: string;
-    score: number;
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-    proximity?: 'close' | 'medium' | 'far';
-}
 
-interface KnownPerson {
-    name: string;
-    imageUri: string;
-}
 
 interface CameraScreenProps {
     staticImageUri?: string | null;
     onBack: () => void;
-    knownPeople?: KnownPerson[];
+    knownPeople?: any[];
 }
 
 export default function CameraScreen({ staticImageUri, onBack, knownPeople = [] }: CameraScreenProps) {
-    const [permission, requestPermission] = useCameraPermissions();
-    const [status, setStatus] = useState(staticImageUri ? 'Tap 🔍 to identify objects in photo' : 'Tap mic to start voice control');
-    const [detections, setDetections] = useState<Detection[]>([]);
-    const lastAlertRef = useRef<number>(0);
-    const cameraRef = useRef<CameraView>(null);
+    const { hasPermission, requestPermission } = useCameraPermission();
+    const device = useCameraDevice('back');
+    const [status, setStatus] = useState('Initializing YOLO...');
+    const [model, setModel] = useState<TensorflowModel | null>(null);
+    const [detections, setDetections] = useState<any[]>([]);
 
-    const handleCommand = useCallback((command: string) => {
-        if (command === 'identify') {
-            // Simulate "Morning to Night" daily items including Brands
-            const dayItems = [
-                'toothbrush', 'toothpaste', 'coffee mug',
-                'Nike water bottle', 'Sony laptop', 'Apple iPhone', 'Coca-Cola can',
-                'bus', 'traffic light', 'backpack',
-                'laptop', 'mouse', 'keyboard',
-                'bed', 'pillow', 'lamp',
-                'glasses', 'plate', 'fork', 'spoon'
-            ];
-            const randomItem = dayItems[Math.floor(Math.random() * dayItems.length)];
+    // Resize plugin
+    const { resize } = useResizePlugin();
 
-            const mockDetections: Detection[] = [
-                { class: randomItem, score: 0.95, x: 150, y: 300, width: 50, height: 50, proximity: 'close' },
-                { class: 'person', score: 0.92, x: 100, y: 200, width: 150, height: 300, proximity: 'medium' },
-            ];
-
-            if (mockDetections.length > 0) {
-                // Build natural language response
-                const parts: string[] = [];
-                const closeItems = mockDetections.filter(d => d.proximity === 'close').map(d => d.class);
-                const otherItems = mockDetections.filter(d => d.proximity !== 'close').map(d => d.class);
-
-                // Handle known person if present
-                if (mockDetections.some(d => d.class === 'person') && knownPeople.length > 0) {
-                    const person = knownPeople[0];
-                    // Replace 'person' with name in lists
-                    const pIdx = closeItems.indexOf('person');
-                    if (pIdx > -1) closeItems[pIdx] = person.name;
-                    const pIdx2 = otherItems.indexOf('person');
-                    if (pIdx2 > -1) otherItems[pIdx2] = person.name;
-                }
-
-                if (closeItems.length > 0) parts.push(`${closeItems.join(', ')} nearby`);
-                if (otherItems.length > 0) parts.push(otherItems.join(', '));
-
-                const response = `I can see: ${parts.join(', ')}`;
-                speak(response);
-                setStatus(`Detected: ${parts.join(', ')}`);
-
-                setDetections(mockDetections);
-            } else {
-                speak('I cannot identify any objects right now');
-                setStatus('No objects detected');
-            }
-        } else if (command === 'help') {
-            speak(
-                "Say 'what is that' to identify objects. I will also warn you if someone is approaching."
-            );
-        }
-    }, [knownPeople]);
-
-    const { isListening, transcript, speak, startListening, stopListening, error } =
-        useVoiceAssistant(handleCommand);
-
+    // Load Model
     useEffect(() => {
-        if (staticImageUri) return;
+        const init = async () => {
+            const loadedModel = await loadModel();
+            if (loadedModel) {
+                setModel(loadedModel);
+                setStatus('Point camera at objects');
+            } else {
+                setStatus('Failed to load YOLO model');
+            }
+        };
+        init();
+    }, []);
 
-        const interval = setInterval(() => {
-            const approaching = Math.random() > 0.95;
-            if (approaching) {
-                const now = Date.now();
-                if (now - lastAlertRef.current > 7000) {
-                    lastAlertRef.current = now;
+    const updateDetectionsJS = Worklets.createRunOnJS((results: any[]) => {
+        setDetections(results);
+    });
 
-                    if (knownPeople.length > 0) {
-                        speak(`${knownPeople[0].name} is approaching you`);
-                        setStatus(`⚠️ ${knownPeople[0].name} approaching!`);
-                    } else {
-                        speak('Warning! Person approaching');
-                        setStatus('⚠️ Person approaching!');
+    const frameProcessor = useFrameProcessor((frame) => {
+        'worklet';
+        if (model == null) return;
+
+        runAtTargetFps(10, () => {
+            'worklet';
+
+            // 1. Resize
+            const resized = resize(frame, {
+                scale: {
+                    width: 640,
+                    height: 640,
+                },
+                pixelFormat: 'rgb',
+                dataType: 'float32',
+            });
+
+            // 2. Run Inference
+            const outputs = model.runSync([resized]);
+            const data = outputs[0]; // Float32Array or Uint8Array
+
+            // Check output shape to determine parsing logic
+            // We can't easily check shape property on TypedArray, but we know model metadata
+            // For now, let's infer from data length or assume standard if not met.
+
+            // YOLO26n NMS-Free: [1, 300, 6] -> 1800 elements
+            // YOLOv8: [1, 84, 8400] -> 705600 elements
+
+            const numElements = data.length;
+            const results = [];
+
+            if (numElements < 5000) {
+                // Assume YOLO26n/End-to-End [1, 300, 6] format
+                // Layout: [batch, n_dets, 6] (x, y, w, h, score, class)
+                const numDets = numElements / 6;
+
+                for (let i = 0; i < numDets; i++) {
+                    const offset = i * 6;
+                    const score = Number(data[offset + 4]);
+
+                    if (score > 0.45) {
+                        const x = Number(data[offset + 0]);
+                        const y = Number(data[offset + 1]);
+                        const w = Number(data[offset + 2]);
+                        const h = Number(data[offset + 3]);
+                        const clsParams = Number(data[offset + 5]);
+
+                        results.push({
+                            class: CLASS_NAMES[Math.round(clsParams)] || 'unknown',
+                            score: score,
+                            x: x - w / 2, // Convert cx,cy to top-left
+                            y: y - h / 2,
+                            width: w,
+                            height: h,
+                            proximity: (w * h) > (640 * 640 * 0.15) ? 'close' : 'far'
+                        });
+                    }
+                }
+            } else {
+                // Assume YOLOv8 [1, 84, 8400] format
+                const numAnchors = 8400;
+                const numClass = 80;
+
+                // Stride: 1 (batch) * 84 * 8400
+                // data layout: [0..83] rows, [0..8399] cols flattened
+                // idx = row * 8400 + col
+
+                for (let i = 0; i < numAnchors; i++) {
+                    // Find max score
+                    let maxScore = 0;
+                    let maxClass = -1;
+
+                    // Loop all 80 classes
+                    for (let c = 0; c < numClass; c++) {
+                        const score = Number(data[(4 + c) * numAnchors + i]);
+                        if (score > maxScore) {
+                            maxScore = score;
+                            maxClass = c;
+                        }
+                    }
+
+                    if (maxScore > 0.5) {
+                        const cx = Number(data[0 * numAnchors + i]);
+                        const cy = Number(data[1 * numAnchors + i]);
+                        const w = Number(data[2 * numAnchors + i]);
+                        const h = Number(data[3 * numAnchors + i]);
+
+                        const x = cx - w / 2;
+                        const y = cy - h / 2;
+
+                        results.push({
+                            class: CLASS_NAMES[maxClass] || 'unknown',
+                            score: maxScore,
+                            x: x,
+                            y: y,
+                            width: w,
+                            height: h,
+                            proximity: (w * h) > (640 * 640 * 0.15) ? 'close' : 'far'
+                        });
                     }
                 }
             }
-        }, 1000);
 
-        return () => clearInterval(interval);
-    }, [speak, staticImageUri, knownPeople]);
+            // Sort and limit results
+            if (results.length > 0) {
+                results.sort((a, b) => b.score - a.score);
+                const topResults = results.slice(0, 20);
+                updateDetectionsJS(topResults);
+            } else {
+                updateDetectionsJS([]);
+            }
+        });
+    }, [model]);
+
+    // Permissions
+    useEffect(() => {
+        if (!hasPermission) requestPermission();
+    }, [hasPermission, requestPermission]);
+
+    // Voice setup
+    const handleCommandRef = useRef<(command: string) => void>(() => { });
+    const { isListening, startListening, stopListening, transcript } = useVoiceAssistant(handleCommandRef.current);
 
     const toggleListening = async () => {
         if (isListening) {
             await stopListening();
-            setStatus('Voice control paused');
         } else {
             await startListening();
-            setStatus('Listening for commands...');
         }
     };
 
-    if (!permission && !staticImageUri) {
-        return (
-            <View style={styles.container}>
-                <Text style={styles.statusText}>Requesting camera permission...</Text>
-            </View>
-        );
-    }
-
-    if (!permission?.granted && !staticImageUri) {
-        return (
-            <View style={styles.container}>
-                <Text style={styles.statusText}>Camera permission required</Text>
-                <TouchableOpacity style={styles.permissionButton} onPress={requestPermission}>
-                    <Text style={styles.permissionButtonText}>Grant Permission</Text>
-                </TouchableOpacity>
-                <TouchableOpacity style={[styles.permissionButton, { marginTop: 10, backgroundColor: '#475569' }]} onPress={onBack}>
-                    <Text style={styles.permissionButtonText}>Go Back</Text>
-                </TouchableOpacity>
-            </View>
-        );
-    }
+    if (!device) return <View style={styles.container}><ActivityIndicator size="large" color="#fff" /></View>;
+    if (!hasPermission) return <View style={styles.container}><Text style={styles.text}>No Camera Permission</Text></View>;
 
     return (
         <View style={styles.container}>
-            {staticImageUri ? (
-                <Image source={{ uri: staticImageUri }} style={styles.camera} resizeMode="contain" />
-            ) : (
-                <CameraView
-                    ref={cameraRef}
-                    style={styles.camera}
-                    facing="back"
-                />
-            )}
+            <Camera
+                style={StyleSheet.absoluteFill}
+                device={device}
+                isActive={true}
+                frameProcessor={frameProcessor}
+                pixelFormat="yuv"
+            />
 
-            <View style={styles.topBar}>
-                <TouchableOpacity onPress={onBack} style={styles.backButton}>
-                    <Text style={styles.backIcon}>←</Text>
-                    <Text style={styles.backText}>Back</Text>
-                </TouchableOpacity>
-
-                <View style={styles.statusIndicator}>
-                    {!staticImageUri && (
-                        <>
-                            <View
-                                style={[
-                                    styles.dot,
-                                    { backgroundColor: isListening ? '#22c55e' : '#ef4444' },
-                                ]}
-                            />
-                            <Text style={styles.statusLabel}>
-                                {isListening ? 'Listening' : 'Voice Off'}
-                            </Text>
-                        </>
-                    )}
-                </View>
-                <Text style={styles.detectionCount}>
-                    {detections.length > 0
-                        ? `${detections.length} objects${detections.some(d => d.proximity === 'close') ? ' (1 close)' : ''}`
-                        : '0 objects'}
-                </Text>
+            <View style={styles.overlay}>
+                {detections.length > 0 && <DetectionOverlay detections={detections} frameWidth={640} frameHeight={640} />}
             </View>
 
-            <View style={styles.crosshairContainer}>
-                <View style={styles.crosshair}>
-                    <View style={styles.crosshairDot} />
-                </View>
-            </View>
-
-            <View style={styles.bottomPanel}>
+            <View style={styles.uiContainer}>
                 <Text style={styles.statusText}>{status}</Text>
-                {transcript && (
-                    <Text style={styles.transcriptText}>Heard: "{transcript}"</Text>
-                )}
-                {error && <Text style={styles.errorText}>{error}</Text>}
-
-                <View style={styles.buttonRow}>
-                    {!staticImageUri && (
-                        <TouchableOpacity
-                            style={[
-                                styles.micButton,
-                                isListening && styles.micButtonActive,
-                            ]}
-                            onPress={toggleListening}
-                        >
-                            <Text style={styles.micIcon}>🎤</Text>
-                        </TouchableOpacity>
-                    )}
-
-                    <TouchableOpacity
-                        style={styles.identifyButton}
-                        onPress={() => handleCommand('identify')}
-                    >
-                        <Text style={styles.identifyIcon}>🔍</Text>
-                    </TouchableOpacity>
-                </View>
-
-                <Text style={styles.hint}>
-                    {staticImageUri ? 'Tap 🔍 to identify objects in this photo' : 'Say "What is that?" or tap 🔍 to identify objects'}
-                </Text>
+                <Text style={styles.subText}>{detections.length} objects detected</Text>
+                {transcript ? <Text style={styles.transcript}>{transcript}</Text> : null}
             </View>
+
+            <TouchableOpacity onPress={onBack} style={styles.backButton}>
+                <Text style={styles.backText}>Back</Text>
+            </TouchableOpacity>
         </View>
     );
 }
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-        backgroundColor: '#000',
-    },
-    camera: {
-        flex: 1,
-    },
-    topBar: {
+    container: { flex: 1, backgroundColor: 'black' },
+    text: { color: 'white', fontSize: 20 },
+    overlay: { ...StyleSheet.absoluteFillObject },
+    uiContainer: {
         position: 'absolute',
-        top: 60,
+        bottom: 40,
         left: 0,
         right: 0,
-        flexDirection: 'row',
-        justifyContent: 'space-between',
         alignItems: 'center',
-        paddingHorizontal: 20,
-        zIndex: 10,
-    },
-    backButton: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        backgroundColor: 'rgba(0,0,0,0.5)',
-        paddingHorizontal: 12,
-        paddingVertical: 6,
-        borderRadius: 20,
-    },
-    backIcon: {
-        color: '#fff',
-        fontSize: 20,
-        marginRight: 4,
-    },
-    backText: {
-        color: '#fff',
-        fontSize: 14,
-        fontWeight: '600',
-    },
-    statusIndicator: {
-        flexDirection: 'row',
-        alignItems: 'center',
-    },
-    dot: {
-        width: 12,
-        height: 12,
-        borderRadius: 6,
-        marginRight: 8,
-    },
-    statusLabel: {
-        color: '#fff',
-        fontSize: 14,
-        fontWeight: '600',
-    },
-    detectionCount: {
-        color: 'rgba(255,255,255,0.7)',
-        fontSize: 14,
-    },
-    crosshairContainer: {
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        right: 0,
-        bottom: 0,
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    crosshair: {
-        width: 80,
-        height: 80,
-        borderRadius: 40,
-        borderWidth: 2,
-        borderColor: 'rgba(255,255,255,0.5)',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    crosshairDot: {
-        width: 8,
-        height: 8,
-        borderRadius: 4,
-        backgroundColor: '#fff',
-    },
-    bottomPanel: {
-        position: 'absolute',
-        bottom: 0,
-        left: 0,
-        right: 0,
-        backgroundColor: 'rgba(0,0,0,0.8)',
-        paddingTop: 20,
-        paddingBottom: 40,
-        paddingHorizontal: 20,
-        alignItems: 'center',
+        padding: 20,
     },
     statusText: {
-        color: '#fff',
+        color: 'white',
         fontSize: 18,
-        fontWeight: '600',
-        textAlign: 'center',
+        fontWeight: 'bold',
+        textShadowColor: 'rgba(0,0,0,0.7)',
+        textShadowRadius: 4,
     },
-    transcriptText: {
-        color: 'rgba(255,255,255,0.6)',
+    subText: {
+        color: '#ccc',
         fontSize: 14,
         marginTop: 4,
     },
-    errorText: {
-        color: '#ef4444',
-        fontSize: 14,
-        marginTop: 4,
+    transcript: {
+        color: '#88fa88',
+        marginTop: 10,
     },
-    buttonRow: {
-        flexDirection: 'row',
-        alignItems: 'center',
-        marginTop: 20,
-        gap: 20,
+    backButton: {
+        position: 'absolute',
+        top: 60,
+        left: 20,
+        backgroundColor: 'rgba(0,0,0,0.5)',
+        padding: 10,
+        borderRadius: 20,
     },
-    micButton: {
-        width: 80,
-        height: 80,
-        borderRadius: 40,
-        backgroundColor: 'rgba(255,255,255,0.2)',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    micButtonActive: {
-        backgroundColor: '#22c55e',
-        shadowColor: '#22c55e',
-        shadowOffset: { width: 0, height: 0 },
-        shadowOpacity: 0.5,
-        shadowRadius: 20,
-    },
-    micIcon: {
-        fontSize: 36,
-    },
-    identifyButton: {
-        width: 64,
-        height: 64,
-        borderRadius: 32,
-        backgroundColor: '#3b82f6',
-        justifyContent: 'center',
-        alignItems: 'center',
-    },
-    identifyIcon: {
-        fontSize: 28,
-    },
-    hint: {
-        color: 'rgba(255,255,255,0.4)',
-        fontSize: 12,
-        marginTop: 16,
-        textAlign: 'center',
-    },
-    permissionButton: {
-        marginTop: 20,
-        backgroundColor: '#3b82f6',
-        paddingHorizontal: 24,
-        paddingVertical: 12,
-        borderRadius: 8,
-    },
-    permissionButtonText: {
-        color: '#fff',
-        fontSize: 16,
-        fontWeight: '600',
-    },
+    backText: { color: 'white' },
 });

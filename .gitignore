@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+venv/
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Large model files
+*.pt
+*.torchscript
+mobile/assets/models/
+web/public/model/
+
+# Expo / Mobile specific
+.expo/
+*.jks
+*.p12
+*.key
+*.mobileprovision
